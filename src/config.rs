@@ -101,14 +101,6 @@ impl Config {
         Ok(())
     }
 
-    pub fn enabled_specs(&self) -> Vec<ForwardSpec> {
-        self.forward
-            .iter()
-            .filter(|e| e.enabled)
-            .map(|e| e.spec.clone())
-            .collect()
-    }
-
     pub fn position(&self, spec: &ForwardSpec) -> Option<usize> {
         self.forward.iter().position(|e| &e.spec == spec)
     }
@@ -249,7 +241,9 @@ mod tests {
         config.upsert(spec("wk:8000", Direction::Local), true);
         config.save(&path).unwrap();
         let back = Config::load(&path).unwrap();
-        assert_eq!(back.enabled_specs(), config.enabled_specs());
+        assert_eq!(back.forward.len(), 1);
+        assert_eq!(back.forward[0].spec, config.forward[0].spec);
+        assert!(back.forward[0].enabled);
         assert!(!path.with_extension("toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

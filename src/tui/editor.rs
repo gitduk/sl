@@ -1,9 +1,9 @@
 //! The one-line pattern editor, sharing the CLI's parser.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 
@@ -25,12 +25,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         Direction::Local => "local    (-L 127.0.0.1:<entry> ⇒ <host>:<target>)",
         Direction::Remote => "remote   (-R <host>:<entry> ⇒ localhost:<target>)",
     };
+    let (before, after) = editor.input.split();
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  pattern     ", Style::default().fg(t::MUTED)),
-            Span::styled(editor.pattern.clone(), Style::default().fg(t::TEXT)),
+            Span::styled(before.to_string(), Style::default().fg(t::TEXT)),
             Span::styled("▏", Style::default().fg(t::PRIMARY)),
+            Span::styled(after.to_string(), Style::default().fg(t::TEXT)),
         ]),
     ];
     if let Some(error) = &editor.error {
@@ -51,21 +53,16 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(t::MUTED),
         )),
         Line::from(vec![
-            Span::styled(
-                "  tab",
-                Style::default().fg(t::WARNING).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" direction  ", Style::default().fg(t::MUTED)),
-            Span::styled(
-                "enter",
-                Style::default().fg(t::WARNING).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" save  ", Style::default().fg(t::MUTED)),
-            Span::styled(
-                "esc",
-                Style::default().fg(t::WARNING).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" cancel", Style::default().fg(t::MUTED)),
+            t::key("  tab"),
+            t::muted(" direction  "),
+            t::key("enter"),
+            t::muted(" save  "),
+            t::key("esc"),
+            t::muted(" cancel  "),
+            t::key("←→"),
+            t::muted(" move  "),
+            t::key("ctrl-w"),
+            t::muted(" word"),
         ]),
     ]);
     f.render_widget(
@@ -83,26 +80,46 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match key.code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter => app.save_editor(),
-        KeyCode::Tab => {
-            if let Mode::Editor(editor) = &mut app.mode {
-                editor.direction = editor.direction.toggled();
-                editor.error = None;
-            }
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+            return;
         }
-        KeyCode::Backspace => {
-            if let Mode::Editor(editor) = &mut app.mode {
-                editor.pattern.pop();
-                editor.error = None;
-            }
-        }
-        KeyCode::Char(c) => {
-            if let Mode::Editor(editor) = &mut app.mode {
-                editor.pattern.push(c);
-                editor.error = None;
-            }
+        KeyCode::Enter => {
+            app.save_editor();
+            return;
         }
         _ => {}
+    }
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let Mode::Editor(editor) = &mut app.mode else {
+        return;
+    };
+    match key.code {
+        KeyCode::Tab => editor.direction = editor.direction.toggled(),
+        KeyCode::Backspace => editor.input.backspace(),
+        KeyCode::Char('h') if ctrl => editor.input.backspace(),
+        KeyCode::Delete => editor.input.delete(),
+        KeyCode::Left => editor.input.left(),
+        KeyCode::Right => editor.input.right(),
+        KeyCode::Home => editor.input.home(),
+        KeyCode::End => editor.input.end(),
+        KeyCode::Char('a') if ctrl => editor.input.home(),
+        KeyCode::Char('e') if ctrl => editor.input.end(),
+        KeyCode::Char('w') if ctrl => editor.input.delete_word_back(),
+        KeyCode::Char(c) if !ctrl => editor.input.insert(c),
+        _ => return,
+    }
+    editor.error = None;
+}
+
+pub fn paste(app: &mut App, text: &str) {
+    let cleaned = super::input::sanitize_paste(text);
+    if cleaned.is_empty() {
+        return;
+    }
+    if let Mode::Editor(editor) = &mut app.mode {
+        editor.input.insert_str(&cleaned);
+        editor.error = None;
     }
 }

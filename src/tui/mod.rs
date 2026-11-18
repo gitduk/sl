@@ -2,6 +2,7 @@
 
 pub mod dialogs;
 pub mod editor;
+pub mod input;
 pub mod keys;
 pub mod logs;
 pub mod state;
@@ -13,7 +14,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -26,14 +27,16 @@ use state::App;
 
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const LOG_REFRESH: Duration = Duration::from_millis(500);
-const RECORD_SYNC: Duration = Duration::from_secs(1);
+/// Uptimes and retry countdowns tick in seconds, so one repaint a second is
+/// enough when nothing else happens.
+const IDLE_REPAINT: Duration = Duration::from_secs(1);
 
 pub fn run(path: PathBuf) -> Result<i32> {
     let mut app = App::new(path)?;
     let mut terminal = enter()?;
     let outcome = event_loop(&mut terminal, &mut app);
     let restored = restore();
-    app.shutdown();
+    app.release_forwarding();
     outcome?;
     restored?;
     Ok(0)
@@ -42,7 +45,7 @@ pub fn run(path: PathBuf) -> Result<i32> {
 fn enter() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     terminal.clear()?;
     Ok(terminal)
@@ -50,32 +53,46 @@ fn enter() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
     Ok(())
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     let mut next_log = Instant::now();
-    let mut next_sync = Instant::now() + RECORD_SYNC;
+    let mut next_repaint = Instant::now();
+    let mut redraw = true;
     loop {
-        terminal.draw(|frame| view::draw(frame, app))?;
-
-        if event::poll(EVENT_POLL)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            keys::handle(app, key);
+        if redraw {
+            terminal.draw(|frame| view::draw(frame, app))?;
+            redraw = false;
         }
-        app.drain_events();
+
+        if event::poll(EVENT_POLL)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    keys::handle(app, key);
+                    redraw = true;
+                }
+                Event::Paste(text) => {
+                    keys::handle_paste(app, &text);
+                    redraw = true;
+                }
+                _ => {}
+            }
+        }
+        let events = app.drain_events();
+        redraw |= events > 0;
 
         let now = Instant::now();
         if now >= next_log {
+            let log_before = app.log.len();
             app.refresh_log();
+            redraw |= app.log.len() != log_before;
             next_log = now + LOG_REFRESH;
         }
-        if now >= next_sync {
-            app.rebuild_rows();
-            next_sync = now + RECORD_SYNC;
+        if now >= next_repaint {
+            redraw = true;
+            next_repaint = now + IDLE_REPAINT;
         }
         if app.quit {
             return Ok(());
@@ -90,6 +107,9 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::keys;
     use super::state::{App, Editor, Mode};
     use super::view;
     use crate::config::Config;
@@ -112,11 +132,10 @@ mod tests {
         for pattern in rows {
             config.upsert(spec(pattern), true);
         }
-        let mut app = App {
+        App {
             config,
             path: dir.join("config.toml"),
             runtime: RuntimeDir::at(dir.join("rt")),
-            rows: Vec::new(),
             statuses: HashMap::new(),
             selected: 0,
             mode: Mode::Normal,
@@ -126,9 +145,7 @@ mod tests {
             log: Vec::new(),
             sessions: None,
             quit: false,
-        };
-        app.rebuild_rows();
-        app
+        }
     }
 
     fn screen(app: &mut App, width: u16, height: u16) -> String {
@@ -192,7 +209,7 @@ mod tests {
     fn editor_overlay_shows_the_pattern_and_errors() {
         let mut app = panel(&[]);
         app.mode = Mode::Editor(Editor {
-            pattern: "wk:8x".into(),
+            input: super::input::TextInput::new("wk:8x"),
             direction: Direction::Remote,
             original: None,
             error: Some("invalid port '8x'".into()),
@@ -204,12 +221,78 @@ mod tests {
         assert!(text.contains("invalid port '8x'"), "{text}");
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn text(value: &str) -> Vec<KeyEvent> {
+        value
+            .chars()
+            .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .collect()
+    }
+
+    #[test]
+    fn typing_edits_at_the_cursor() {
+        let mut app = panel(&[]);
+        app.new_editor();
+        for event in text("8000") {
+            keys::handle(&mut app, event);
+        }
+        keys::handle(&mut app, key(KeyCode::Home));
+        for event in text("wk:") {
+            keys::handle(&mut app, event);
+        }
+        keys::handle(&mut app, key(KeyCode::End));
+        keys::handle(&mut app, key(KeyCode::Left));
+        keys::handle(&mut app, key(KeyCode::Delete));
+        match &app.mode {
+            Mode::Editor(editor) => assert_eq!(editor.input.value(), "wk:800"),
+            _ => panic!("editor must stay open"),
+        }
+    }
+
+    #[test]
+    fn pasting_a_list_reaches_the_editor_in_one_piece() {
+        let mut app = panel(&[]);
+        app.new_editor();
+        keys::handle_paste(&mut app, "wk:8005,9200,16379\n");
+        match &app.mode {
+            Mode::Editor(editor) => assert_eq!(editor.input.value(), "wk:8005,9200,16379"),
+            _ => panic!("editor must stay open"),
+        }
+        app.save_editor();
+        assert_eq!(app.config.forward.len(), 3);
+    }
+
+    #[test]
+    fn q_quits_without_asking_even_with_forwards_running() {
+        let mut app = panel(&["wk:8000"]);
+        app.statuses.insert(
+            spec("wk:8000"),
+            Status::Up {
+                since: std::time::SystemTime::now(),
+            },
+        );
+        keys::handle(&mut app, key(KeyCode::Char('q')));
+        assert!(app.quit);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn pasting_into_the_filter_filters() {
+        let mut app = panel(&["wk:8000", "ds:9000"]);
+        app.filtering = true;
+        keys::handle_paste(&mut app, " ds ");
+        assert_eq!(app.filter, "ds");
+        assert_eq!(app.visible().len(), 1);
+    }
+
     #[test]
     fn help_overlay_lists_the_keys() {
         let mut app = panel(&["wk:8000"]);
         app.mode = Mode::Help;
         let text = screen(&mut app, 100, 34);
         assert!(text.contains("restart the selected forward"), "{text}");
-        assert!(text.contains("sl -k"), "{text}");
     }
 }

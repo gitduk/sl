@@ -3,20 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, Entry};
 use crate::error::Result;
 use crate::forward::{Direction, ForwardSpec};
-use crate::runtime::{Owner, RuntimeDir, SessionRecord, process_alive};
+use crate::runtime::RuntimeDir;
 use crate::sessions::{EngineConfig, Sessions, Status};
 
-#[derive(Clone, Debug)]
-pub struct Row {
-    pub spec: ForwardSpec,
-    pub enabled: bool,
-    pub owner: Owner,
-}
+use super::input::TextInput;
 
 pub enum Mode {
     Normal,
@@ -26,16 +21,30 @@ pub enum Mode {
 }
 
 pub struct Editor {
-    pub pattern: String,
+    pub input: TextInput,
     pub direction: Direction,
     /// The row being edited, when this is not a fresh row.
     pub original: Option<ForwardSpec>,
     pub error: Option<String>,
 }
 
+impl Editor {
+    pub fn for_spec(original: Option<ForwardSpec>) -> Self {
+        let (pattern, direction) = match &original {
+            Some(spec) => (spec.pattern(), spec.direction),
+            None => (String::new(), Direction::Local),
+        };
+        Editor {
+            input: TextInput::new(&pattern),
+            direction,
+            original,
+            error: None,
+        }
+    }
+}
+
 pub enum Confirm {
     Delete(ForwardSpec),
-    Quit,
 }
 
 pub struct Message {
@@ -54,7 +63,6 @@ pub struct App {
     pub config: Config,
     pub path: PathBuf,
     pub runtime: RuntimeDir,
-    pub rows: Vec<Row>,
     pub statuses: HashMap<ForwardSpec, Status>,
     pub selected: usize,
     pub mode: Mode,
@@ -74,7 +82,6 @@ impl App {
             config,
             path,
             runtime,
-            rows: Vec::new(),
             statuses: HashMap::new(),
             selected: 0,
             mode: Mode::Normal,
@@ -85,93 +92,66 @@ impl App {
             sessions: None,
             quit: false,
         };
-        let reaped = app.runtime.reap_orphans();
-        if reaped > 0 {
-            app.info(format!(
-                "reclaimed {reaped} forward(s) left by a closed panel"
-            ));
-        }
-        app.rebuild_rows();
+        app.runtime.prune_dead();
         app.start_engine()?;
+        app.drain_events();
         app.refresh_log();
         Ok(app)
     }
 
     fn start_engine(&mut self) -> Result<()> {
+        self.prime_statuses();
         let rows: Vec<(ForwardSpec, bool)> = self
-            .rows
+            .config
+            .forward
             .iter()
-            .filter(|row| row.owner == Owner::Panel)
-            .map(|row| (row.spec.clone(), row.enabled))
+            .map(|entry| (entry.spec.clone(), entry.enabled))
             .collect();
-        let cfg = EngineConfig::new(
-            self.config.options.clone(),
-            self.runtime.clone(),
-            Owner::Panel,
-        )
-        .batch_mode(true);
+        let cfg =
+            EngineConfig::new(self.config.options.clone(), self.runtime.clone()).batch_mode(true);
         self.sessions = Some(Sessions::start(rows, cfg)?);
         Ok(())
     }
 
-    /// Rows come from the config plus whatever daemons are already running.
-    pub fn rebuild_rows(&mut self) {
-        let records = self.runtime.records().unwrap_or_default();
-        let mut rows: Vec<Row> = Vec::new();
-
-        for entry in &self.config.forward {
-            match live_daemon(&records, &entry.spec) {
-                Some(record) => {
-                    self.statuses.insert(
-                        entry.spec.clone(),
-                        Status::Up {
-                            since: started_at(record),
-                        },
-                    );
-                    rows.push(Row {
-                        spec: entry.spec.clone(),
-                        enabled: true,
-                        owner: Owner::Daemon,
-                    });
-                }
-                None => rows.push(Row {
-                    spec: entry.spec.clone(),
-                    enabled: entry.enabled,
-                    owner: Owner::Panel,
-                }),
-            }
-        }
-        for record in &records {
-            if record.owner != Owner::Daemon || !process_alive(record.ssh_pid) {
-                continue;
-            }
-            if rows.iter().any(|row| row.spec == record.spec) {
-                continue;
-            }
-            self.statuses.insert(
-                record.spec.clone(),
-                Status::Up {
-                    since: started_at(record),
-                },
-            );
-            rows.push(Row {
-                spec: record.spec.clone(),
-                enabled: true,
-                owner: Owner::Daemon,
-            });
-        }
-
-        self.rows = rows;
-        self.clamp_selection();
+    /// Seeds each row with the state it is really in, read from the runtime
+    /// records: a forward a previous panel left running is already up, so the
+    /// first frame never shows a placeholder for it.
+    fn prime_statuses(&mut self) {
+        let seeded: Vec<(ForwardSpec, Status)> = self
+            .config
+            .forward
+            .iter()
+            .filter(|entry| !self.statuses.contains_key(&entry.spec))
+            .map(|entry| {
+                let status = match crate::sessions::adopted(&self.runtime, &entry.spec) {
+                    Some(record) => Status::Up {
+                        since: std::time::UNIX_EPOCH + Duration::from_secs(record.started_at),
+                    },
+                    None if entry.enabled => Status::Starting,
+                    None => Status::Stopped,
+                };
+                (entry.spec.clone(), status)
+            })
+            .collect();
+        self.statuses.extend(seeded);
     }
 
-    pub fn drain_events(&mut self) {
+    /// Applies every queued engine event; returns how many arrived, which is
+    /// also "the screen is now stale" for the caller.
+    pub fn drain_events(&mut self) -> usize {
         let Some(sessions) = &self.sessions else {
-            return;
+            return 0;
         };
+        let mut applied = 0;
         while let Ok(event) = sessions.events().try_recv() {
             self.statuses.insert(event.spec, event.status);
+            applied += 1;
         }
+        applied
+    }
+
+    pub fn status_ref(&self, spec: &ForwardSpec) -> Option<&Status> {
+        self.statuses.get(spec)
     }
 
     pub fn status_of(&self, spec: &ForwardSpec) -> Status {
@@ -185,30 +165,32 @@ impl App {
         };
     }
 
-    pub fn matches_filter(&self, row: &Row) -> bool {
-        if self.filter.is_empty() {
+    fn matches_filter(entry: &Entry, needle: &str) -> bool {
+        if needle.is_empty() {
             return true;
         }
-        let needle = self.filter.to_lowercase();
-        row.spec.host.as_str().to_lowercase().contains(&needle)
-            || row.spec.entry.to_string().contains(&needle)
-            || row.spec.target.to_string().contains(&needle)
+        let spec = &entry.spec;
+        spec.host.as_str().to_lowercase().contains(needle)
+            || spec.entry.to_string().contains(needle)
+            || spec.target.to_string().contains(needle)
     }
 
     pub fn visible(&self) -> Vec<usize> {
-        self.rows
+        let needle = self.filter.to_lowercase();
+        self.config
+            .forward
             .iter()
             .enumerate()
-            .filter(|(_, row)| self.matches_filter(row))
+            .filter(|(_, entry)| Self::matches_filter(entry, &needle))
             .map(|(idx, _)| idx)
             .collect()
     }
 
-    pub fn selected_row(&self) -> Option<&Row> {
+    pub fn selected_row(&self) -> Option<&Entry> {
         let visible = self.visible();
         visible
             .get(self.selected)
-            .and_then(|idx| self.rows.get(*idx))
+            .and_then(|idx| self.config.forward.get(*idx))
     }
 
     fn clamp_selection(&mut self) {
@@ -276,62 +258,56 @@ impl App {
         }
     }
 
-    pub fn toggle_selected(&mut self) {
-        let Some(row) = self.selected_row().cloned() else {
-            return;
-        };
-        if row.owner == Owner::Daemon {
-            self.info("this row runs outside the panel — stop it with: sl -k <host>");
-            return;
-        }
-        let run = !row.enabled;
-        if let Some(entry) = self.config.forward.iter_mut().find(|e| e.spec == row.spec) {
-            entry.enabled = run;
+    /// Writes `enabled` for these rows, saves the config, and tells the engine.
+    fn apply_enabled(&mut self, specs: &[ForwardSpec], run: bool) {
+        for spec in specs {
+            if let Some(entry) = self.config.forward.iter_mut().find(|e| &e.spec == spec) {
+                entry.enabled = run;
+            }
         }
         if !self.commit() {
             return;
         }
         if let Some(sessions) = &self.sessions {
-            sessions.set_running(&row.spec, run);
+            for spec in specs {
+                sessions.set_running(spec, run);
+            }
         }
-        self.rebuild_rows();
+        self.clamp_selection();
+    }
+
+    pub fn toggle_selected(&mut self) {
+        let Some(entry) = self.selected_row().cloned() else {
+            return;
+        };
+        let run = !entry.enabled;
+        self.apply_enabled(std::slice::from_ref(&entry.spec), run);
         self.info(format!(
             "{} {}",
             if run { "started" } else { "stopped" },
-            row.spec
+            entry.spec
         ));
     }
 
     pub fn restart_selected(&mut self) {
-        let Some(row) = self.selected_row().cloned() else {
+        let Some(entry) = self.selected_row().cloned() else {
             return;
         };
-        if row.owner == Owner::Daemon {
-            self.info("this row runs outside the panel — restart it with: sl -k && sl -d");
-            return;
-        }
-        if let Some(entry) = self.config.forward.iter_mut().find(|e| e.spec == row.spec) {
-            entry.enabled = true;
-        }
-        let _ = self.commit();
+        self.apply_enabled(std::slice::from_ref(&entry.spec), true);
         if let Some(sessions) = &self.sessions {
-            sessions.restart(&row.spec);
+            sessions.restart(&entry.spec);
         }
-        self.rebuild_rows();
-        self.success(format!("restarting {}", row.spec));
+        self.success(format!("restarting {}", entry.spec));
     }
 
     pub fn set_all(&mut self, run: bool) {
-        for entry in &mut self.config.forward {
-            entry.enabled = run;
-        }
-        let _ = self.commit();
-        if let Some(sessions) = &self.sessions {
-            for row in self.rows.iter().filter(|r| r.owner == Owner::Panel) {
-                sessions.set_running(&row.spec, run);
-            }
-        }
-        self.rebuild_rows();
+        let specs: Vec<ForwardSpec> = self
+            .config
+            .forward
+            .iter()
+            .map(|entry| entry.spec.clone())
+            .collect();
+        self.apply_enabled(&specs, run);
         self.info(if run {
             "started all rows"
         } else {
@@ -347,13 +323,6 @@ impl App {
     }
 
     pub fn delete_row(&mut self, spec: &ForwardSpec) {
-        let is_daemon = self
-            .rows
-            .iter()
-            .any(|row| row.spec == *spec && row.owner == Owner::Daemon);
-        if is_daemon {
-            self.runtime.kill_spec(spec);
-        }
         if let Some(sessions) = &self.sessions {
             sessions.set_running(spec, false);
         }
@@ -361,22 +330,9 @@ impl App {
         let _ = self.runtime.remove_record(spec);
         self.statuses.remove(spec);
         let _ = self.commit();
-        self.rebuild_rows();
+        self.clamp_selection();
         self.refresh_log();
         self.success(format!("removed {spec}"));
-    }
-
-    pub fn request_quit(&mut self) {
-        let running = self
-            .rows
-            .iter()
-            .filter(|row| self.status_of(&row.spec).is_up())
-            .count();
-        if running == 0 {
-            self.quit = true;
-        } else {
-            self.mode = Mode::Confirm(Confirm::Quit);
-        }
     }
 
     pub fn test_selected(&mut self) {
@@ -400,79 +356,54 @@ impl App {
         }
     }
 
+    /// Opens the editor on the selected row, or empty when nothing is selected.
     pub fn open_editor(&mut self) {
-        let row = self.selected_row().cloned();
-        match row {
-            Some(row) if row.owner == Owner::Daemon => {
-                self.info("this row runs outside the panel; it cannot be edited here")
-            }
-            Some(row) => {
-                self.mode = Mode::Editor(Editor {
-                    pattern: row.spec.pattern(),
-                    direction: row.spec.direction,
-                    original: Some(row.spec),
-                    error: None,
-                })
-            }
-            None => {
-                self.mode = Mode::Editor(Editor {
-                    pattern: String::new(),
-                    direction: Direction::Local,
-                    original: None,
-                    error: None,
-                })
-            }
-        }
+        let original = self.selected_row().map(|entry| entry.spec.clone());
+        self.mode = Mode::Editor(Editor::for_spec(original));
     }
 
     pub fn new_editor(&mut self) {
-        self.mode = Mode::Editor(Editor {
-            pattern: String::new(),
-            direction: Direction::Local,
-            original: None,
-            error: None,
-        });
+        self.mode = Mode::Editor(Editor::for_spec(None));
     }
 
-    /// Parses the editor's single pattern line with the same parser the CLI
-    /// uses, then applies it to a copy of the config so a rejection changes
-    /// nothing.
+    /// Parses the editor's pattern line with the parser the CLI uses and
+    /// applies every row it expands to; a rejection changes nothing.
     pub fn save_editor(&mut self) {
         let Mode::Editor(editor) = &self.mode else {
             return;
         };
-        let patterns = vec![editor.pattern.trim().to_string()];
+        let patterns = vec![editor.input.value().trim().to_string()];
         let direction = editor.direction;
         let original = editor.original.clone();
-        let spec = match ForwardSpec::parse_all(&patterns, direction) {
-            Ok(mut specs) => specs.remove(0),
-            Err(e) => {
-                if let Mode::Editor(editor) = &mut self.mode {
-                    editor.error = Some(e.to_string());
-                }
-                return;
-            }
+        let specs = match ForwardSpec::parse_all(&patterns, direction) {
+            Ok(specs) => specs,
+            Err(e) => return self.editor_error(e.to_string()),
         };
+        if original.is_some() && specs.len() > 1 {
+            return self.editor_error(
+                "editing one row takes one pattern; press n to add several".to_string(),
+            );
+        }
 
         let mut next = self.config.clone();
         if let Some(old) = &original
-            && *old != spec
+            && !specs.contains(old)
         {
             next.remove(old);
         }
-        next.upsert(spec.clone(), true);
-        if let Err(e) = next.validate() {
-            if let Mode::Editor(editor) = &mut self.mode {
-                editor.error = Some(e.to_string());
-            }
-            return;
+        for spec in &specs {
+            next.upsert(spec.clone(), true);
         }
+        if let Err(e) = next.validate() {
+            return self.editor_error(e.to_string());
+        }
+
         self.config = next;
         if !self.commit() {
             return;
         }
         if let Some(old) = &original
-            && *old != spec
+            && !specs.contains(old)
         {
             if let Some(sessions) = &self.sessions {
                 sessions.set_running(old, false);
@@ -480,11 +411,14 @@ impl App {
             let _ = self.runtime.remove_record(old);
         }
         if let Some(sessions) = &self.sessions {
-            sessions.set_running(&spec, true);
+            for spec in &specs {
+                sessions.set_running(spec, true);
+            }
         }
+
         self.mode = Mode::Normal;
-        self.rebuild_rows();
-        if let Some(idx) = self.rows.iter().position(|row| row.spec == spec) {
+        let first = specs[0].clone();
+        if let Some(idx) = self.config.position(&first) {
             self.selected = self
                 .visible()
                 .iter()
@@ -492,30 +426,36 @@ impl App {
                 .unwrap_or(self.selected);
         }
         self.refresh_log();
-        self.success(format!("saved {spec}"));
+        let message = match specs.len() {
+            1 => format!("saved {first}"),
+            count => format!("saved {count} rows for {}", first.host),
+        };
+        self.success(message);
     }
 
-    pub fn shutdown(&mut self) {
+    fn editor_error(&mut self, message: String) {
+        if let Mode::Editor(editor) = &mut self.mode {
+            editor.error = Some(message);
+        }
+    }
+
+    /// Forwards outlive the panel: quitting leaves them running for the next
+    /// panel to adopt.
+    pub fn release_forwarding(&mut self) {
         if let Some(sessions) = self.sessions.take() {
-            sessions.shutdown();
+            sessions.release();
         }
     }
 }
 
-fn live_daemon<'a>(records: &'a [SessionRecord], spec: &ForwardSpec) -> Option<&'a SessionRecord> {
-    records.iter().find(|record| {
-        record.spec == *spec && record.owner == Owner::Daemon && process_alive(record.ssh_pid)
-    })
-}
-
-fn started_at(record: &SessionRecord) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(record.started_at)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::SystemTime;
+
     use super::*;
     use crate::forward::ForwardSpec;
+    use crate::runtime::SessionRecord;
 
     fn spec(pattern: &str) -> ForwardSpec {
         let args = vec![pattern.to_string()];
@@ -525,7 +465,9 @@ mod tests {
     }
 
     fn app_with(rows: &[(&str, bool)]) -> App {
-        let dir = std::env::temp_dir().join(format!("sl-app-{}", std::process::id()));
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("sl-app-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut config = Config::default();
         for (pattern, enabled) in rows {
@@ -535,7 +477,6 @@ mod tests {
             config,
             path: dir.join("config.toml"),
             runtime: RuntimeDir::at(dir.join("rt")),
-            rows: Vec::new(),
             statuses: HashMap::new(),
             selected: 0,
             mode: Mode::Normal,
@@ -549,9 +490,69 @@ mod tests {
     }
 
     #[test]
+    fn first_paint_shows_what_the_engine_is_about_to_do() {
+        let mut app = app_with(&[("wk:8000", true), ("ds:9000", false)]);
+        app.prime_statuses();
+        assert!(matches!(app.status_of(&spec("wk:8000")), Status::Starting));
+        assert!(matches!(app.status_of(&spec("ds:9000")), Status::Stopped));
+
+        app.statuses.insert(
+            spec("wk:8000"),
+            Status::Up {
+                since: SystemTime::now(),
+            },
+        );
+        app.prime_statuses();
+        assert!(
+            app.status_of(&spec("wk:8000")).is_up(),
+            "priming must not overwrite a known status"
+        );
+    }
+
+    #[test]
+    fn first_paint_reads_a_running_tunnel_from_its_record() {
+        let mut app = app_with(&[("wk:8000", true)]);
+        let live = spec("wk:8000");
+        let mut stand_in = std::process::Command::new("yes")
+            .arg("--")
+            .arg(live.forward_arg())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawns yes");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !crate::runtime::process_carries(stand_in.id(), &live.forward_arg())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        app.runtime
+            .write_record(&SessionRecord {
+                spec: live.clone(),
+                ssh_pid: stand_in.id(),
+                started_at: 1_700_000_000,
+            })
+            .unwrap();
+
+        app.prime_statuses();
+        match app.status_of(&live) {
+            Status::Up { since } => assert_eq!(
+                since
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("epoch")
+                    .as_secs(),
+                1_700_000_000
+            ),
+            other => panic!("a running tunnel must prime as up: {other:?}"),
+        }
+
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
+    }
+
+    #[test]
     fn filter_keeps_matching_rows_selectable() {
         let mut app = app_with(&[("wk:8000", true), ("ds:9000", true)]);
-        app.rebuild_rows();
         assert_eq!(app.visible().len(), 2);
         app.filter = "90".into();
         assert_eq!(app.visible(), vec![1]);
@@ -570,7 +571,7 @@ mod tests {
     fn editor_rejects_bad_pattern_without_touching_config() {
         let mut app = app_with(&[]);
         app.mode = Mode::Editor(Editor {
-            pattern: "wk:x".into(),
+            input: TextInput::new("wk:x"),
             direction: Direction::Local,
             original: None,
             error: None,
@@ -584,10 +585,55 @@ mod tests {
     }
 
     #[test]
+    fn editor_expands_a_comma_list_into_one_row_per_port() {
+        let mut app = app_with(&[]);
+        app.mode = Mode::Editor(Editor {
+            input: TextInput::new("wk:8005,9200,16379,19530,4000,3021,8006,10001"),
+            direction: Direction::Local,
+            original: None,
+            error: None,
+        });
+        app.save_editor();
+        let ports: Vec<u16> = app
+            .config
+            .forward
+            .iter()
+            .map(|entry| entry.spec.entry.get())
+            .collect();
+        assert_eq!(
+            ports,
+            vec![8005, 9200, 16379, 19530, 4000, 3021, 8006, 10001]
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(Config::load(&app.path).unwrap().forward.len(), 8);
+    }
+
+    #[test]
+    fn editing_one_row_refuses_a_comma_list() {
+        let mut app = app_with(&[("wk:8000", true)]);
+        let original = app.config.forward[0].spec.clone();
+        app.mode = Mode::Editor(Editor {
+            input: TextInput::new("wk:8000,8001"),
+            direction: Direction::Local,
+            original: Some(original),
+            error: None,
+        });
+        app.save_editor();
+        assert_eq!(app.config.forward.len(), 1);
+        match &app.mode {
+            Mode::Editor(editor) => {
+                let error = editor.error.as_deref().unwrap_or_default();
+                assert!(error.contains("press n"), "{error}");
+            }
+            _ => panic!("editor must stay open"),
+        }
+    }
+
+    #[test]
     fn editor_refuses_a_port_conflict_and_stays_open() {
         let mut app = app_with(&[("wk:8000", true)]);
         app.mode = Mode::Editor(Editor {
-            pattern: "ds:8000".into(),
+            input: TextInput::new("ds:8000"),
             direction: Direction::Local,
             original: None,
             error: None,

@@ -161,7 +161,7 @@ impl ForwardSpec {
         let mut rows: Vec<ForwardSpec> = Vec::new();
         for arg in args {
             let parts: Vec<&str> = arg.split(':').collect();
-            let mut specs = match parts.as_slice() {
+            let specs: Vec<ForwardSpec> = match parts.as_slice() {
                 [entry, host, target] => vec![ForwardSpec {
                     host: Host::parse(host)?,
                     direction,
@@ -170,21 +170,22 @@ impl ForwardSpec {
                 }],
                 [host, ports] => {
                     let host = Host::parse(host)?;
-                    let mut specs = Vec::new();
-                    for port in ports.split(',') {
-                        let port = Port::parse(port)?;
-                        specs.push(ForwardSpec {
-                            host: host.clone(),
-                            direction,
-                            entry: port,
-                            target: port,
-                        });
-                    }
-                    specs
+                    ports
+                        .split(',')
+                        .map(|port| {
+                            let port = Port::parse(port)?;
+                            Ok(ForwardSpec {
+                                host: host.clone(),
+                                direction,
+                                entry: port,
+                                target: port,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, SpecError>>()?
                 }
                 _ => return Err(SpecError::BadPattern(arg.clone())),
             };
-            for spec in specs.drain(..) {
+            for spec in specs {
                 if rows.contains(&spec) {
                     return Err(SpecError::Duplicate(spec));
                 }

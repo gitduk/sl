@@ -6,28 +6,29 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Padding, Paragraph, Row as TableRow, Table, TableState};
+use ratatui::widgets::{Block, Cell, Padding, Paragraph, Row, Table, TableState};
 
-use super::state::{App, Row};
+use super::state::App;
 use super::theme as t;
-use crate::runtime::Owner;
+use crate::config::Entry;
+use crate::forward::Direction;
 use crate::sessions::Status;
 
 const STATE_WIDTH: u16 = 24;
 
+/// What a row reads as before the engine has said anything about it.
+const UNKNOWN: Status = Status::Stopped;
+
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
-    if app.rows.is_empty() && app.filter.is_empty() {
+    if app.config.forward.is_empty() && app.filter.is_empty() {
         let hint = Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "  No forwards yet",
-                Style::default().fg(t::MUTED),
-            )),
+            Line::from(t::muted("  No forwards yet")),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Press ", Style::default().fg(t::MUTED)),
                 Span::styled(
-                    "n",
+                    "a",
                     Style::default().fg(t::WARNING).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" to add one, e.g. ", Style::default().fg(t::MUTED)),
@@ -39,7 +40,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let header = TableRow::new(vec![
+    let header = Row::new(vec![
         Cell::from(""),
         Cell::from("Host"),
         Cell::from("Listen"),
@@ -47,14 +48,14 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         Cell::from("State"),
         Cell::from("Up"),
         Cell::from("Retry"),
-        Cell::from("Src"),
     ])
     .style(Style::default().fg(t::MUTED).add_modifier(Modifier::BOLD));
 
     let host_width = app
-        .rows
+        .config
+        .forward
         .iter()
-        .map(|row| row.spec.host.as_str().len())
+        .map(|entry| entry.spec.host.as_str().len())
         .max()
         .unwrap_or(4)
         .max(4) as u16;
@@ -62,38 +63,10 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible();
     let mut rows = Vec::with_capacity(visible.len());
     for index in visible {
-        let Some(row) = app.rows.get(index) else {
+        let Some(entry) = app.config.forward.get(index) else {
             continue;
         };
-        let (state_text, state_style) = status_cell(app, row);
-        let mark_color = if row.spec.direction == crate::forward::Direction::Local {
-            t::SUCCESS
-        } else {
-            t::PRIMARY
-        };
-        let cells = vec![
-            Cell::from(Span::styled(
-                format!("[{}]", row.spec.direction.tag()),
-                Style::default().fg(mark_color),
-            )),
-            Cell::from(Span::styled(
-                row.spec.host.to_string(),
-                Style::default().fg(if row.enabled { t::TEXT } else { t::MUTED }),
-            )),
-            Cell::from(row.spec.listen_display()),
-            Cell::from(row.spec.target_display()),
-            Cell::from(Span::styled(state_text, state_style)),
-            Cell::from(uptime_cell(app, row)),
-            Cell::from(retry_cell(app, row)),
-            Cell::from(Span::styled(
-                row.owner.as_str(),
-                Style::default().fg(match row.owner {
-                    Owner::Panel => t::TEXT,
-                    Owner::Daemon => t::WARNING,
-                }),
-            )),
-        ];
-        rows.push(TableRow::new(cells));
+        rows.push(Row::new(cells(app, entry)));
     }
 
     let table = Table::new(
@@ -106,7 +79,6 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(STATE_WIDTH),
             Constraint::Length(6),
             Constraint::Length(6),
-            Constraint::Length(7),
         ],
     )
     .header(header)
@@ -119,16 +91,72 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
+fn cells(app: &App, entry: &Entry) -> Vec<Cell<'static>> {
+    let status = app.status_ref(&entry.spec).unwrap_or(&UNKNOWN);
+    let mark_color = match entry.spec.direction {
+        Direction::Local => t::SUCCESS,
+        Direction::Remote => t::PRIMARY,
+    };
+    let up = match status {
+        Status::Up { since } => elapsed(*since),
+        _ => "-".to_string(),
+    };
+    let retry = match status {
+        Status::Waiting { attempt, .. } => attempt.to_string(),
+        _ => "-".to_string(),
+    };
+    vec![
+        Cell::from(Span::styled(
+            format!("[{}]", entry.spec.direction.tag()),
+            Style::default().fg(mark_color),
+        )),
+        Cell::from(Span::styled(
+            entry.spec.host.to_string(),
+            Style::default().fg(if entry.enabled { t::TEXT } else { t::MUTED }),
+        )),
+        Cell::from(entry.spec.listen_display()),
+        Cell::from(entry.spec.target_display()),
+        Cell::from(state_cell(entry, status)),
+        Cell::from(Span::styled(up, Style::default().fg(t::MUTED))),
+        Cell::from(Span::styled(retry, Style::default().fg(t::MUTED))),
+    ]
+}
+
+fn state_cell(entry: &Entry, status: &Status) -> Span<'static> {
+    if !entry.enabled {
+        return Span::styled("disabled", Style::default().fg(t::MUTED));
+    }
+    match status {
+        Status::Starting => Span::styled("starting", Style::default().fg(t::WARNING)),
+        Status::Up { .. } => Span::styled("up", Style::default().fg(t::SUCCESS)),
+        Status::Failed { reason } => Span::styled(
+            shorten(reason, STATE_WIDTH as usize - 1),
+            Style::default().fg(t::ERROR),
+        ),
+        Status::Waiting { attempt, retry_at } => {
+            let left = retry_at
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs();
+            Span::styled(
+                format!("retry #{attempt} in {left}s"),
+                Style::default().fg(t::WARNING),
+            )
+        }
+        Status::Stopped => Span::styled("stopped", Style::default().fg(t::MUTED)),
+    }
+}
+
 fn title(app: &App) -> Line<'static> {
-    let up = app
-        .rows
+    let statuses: Vec<Status> = app
+        .config
+        .forward
         .iter()
-        .filter(|row| app.status_of(&row.spec).is_up())
-        .count();
-    let failed = app
-        .rows
+        .map(|entry| app.status_of(&entry.spec))
+        .collect();
+    let up = statuses.iter().filter(|status| status.is_up()).count();
+    let failed = statuses
         .iter()
-        .filter(|row| matches!(app.status_of(&row.spec), Status::Failed { .. }))
+        .filter(|status| matches!(status, Status::Failed { .. }))
         .count();
     let mut spans = vec![
         Span::styled(
@@ -136,7 +164,7 @@ fn title(app: &App) -> Line<'static> {
             Style::default().fg(t::PRIMARY).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{} rows  ", app.rows.len()),
+            format!("{} rows  ", app.config.forward.len()),
             Style::default().fg(t::MUTED),
         ),
         Span::styled(format!("{up} up"), Style::default().fg(t::SUCCESS)),
@@ -154,46 +182,6 @@ fn title(app: &App) -> Line<'static> {
         ));
     }
     Line::from(spans)
-}
-
-fn status_cell(app: &App, row: &Row) -> (String, Style) {
-    if row.owner == Owner::Panel && !row.enabled {
-        return ("disabled".into(), Style::default().fg(t::MUTED));
-    }
-    match app.status_of(&row.spec) {
-        Status::Starting => ("starting".into(), Style::default().fg(t::WARNING)),
-        Status::Up { .. } => ("up".into(), Style::default().fg(t::SUCCESS)),
-        Status::Failed { reason } => (
-            shorten(&reason, STATE_WIDTH as usize - 1),
-            Style::default().fg(t::ERROR),
-        ),
-        Status::Waiting { attempt, retry_at } => {
-            let left = retry_at
-                .saturating_duration_since(std::time::Instant::now())
-                .as_secs();
-            (
-                format!("retry #{attempt} in {left}s"),
-                Style::default().fg(t::WARNING),
-            )
-        }
-        Status::Stopped => ("stopped".into(), Style::default().fg(t::MUTED)),
-    }
-}
-
-fn uptime_cell(app: &App, row: &Row) -> Span<'static> {
-    match app.status_of(&row.spec) {
-        Status::Up { since } => Span::styled(elapsed(since), Style::default().fg(t::MUTED)),
-        _ => Span::styled("-", Style::default().fg(t::MUTED)),
-    }
-}
-
-fn retry_cell(app: &App, row: &Row) -> Span<'static> {
-    match app.status_of(&row.spec) {
-        Status::Waiting { attempt, .. } => {
-            Span::styled(attempt.to_string(), Style::default().fg(t::WARNING))
-        }
-        _ => Span::styled("-", Style::default().fg(t::MUTED)),
-    }
 }
 
 fn elapsed(since: SystemTime) -> String {

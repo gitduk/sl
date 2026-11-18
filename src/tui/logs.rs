@@ -2,8 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 
 use super::state::App;
@@ -22,13 +21,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let skip = app.log.len().saturating_sub(visible);
     let lines: Vec<Line> = app.log[skip..]
         .iter()
-        .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(t::MUTED))))
+        .map(|line| Line::from(t::muted(line.clone())))
         .collect();
     let body = if lines.is_empty() {
-        vec![Line::from(Span::styled(
-            " nothing yet",
-            Style::default().fg(t::MUTED),
-        ))]
+        vec![Line::from(t::muted(" nothing yet"))]
     } else {
         lines
     };

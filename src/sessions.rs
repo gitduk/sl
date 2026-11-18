@@ -2,6 +2,7 @@
 //! at a time, every state change reported on one channel.
 
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::Options;
 use crate::error::Result;
 use crate::forward::ForwardSpec;
-use crate::runtime::{Owner, RuntimeDir, SessionRecord};
+use crate::runtime::{RuntimeDir, SessionRecord};
 
 const TICK: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(100);
@@ -51,17 +52,15 @@ pub enum Request {
 pub struct EngineConfig {
     pub options: Options,
     pub runtime: RuntimeDir,
-    pub owner: Owner,
     pub ssh_program: PathBuf,
     pub batch_mode: bool,
 }
 
 impl EngineConfig {
-    pub fn new(options: Options, runtime: RuntimeDir, owner: Owner) -> Self {
+    pub fn new(options: Options, runtime: RuntimeDir) -> Self {
         EngineConfig {
             options,
             runtime,
-            owner,
             ssh_program: PathBuf::from("ssh"),
             batch_mode: false,
         }
@@ -80,16 +79,24 @@ struct RowCtl {
     restart: AtomicBool,
     pid: AtomicU32,
     shutdown: Arc<AtomicBool>,
+    /// Set when the handle is released: supervise stops watching, the ssh stays.
+    released: Arc<AtomicBool>,
 }
 
 impl RowCtl {
-    fn new(running: bool, shutdown: Arc<AtomicBool>) -> Self {
+    fn new(running: bool, shutdown: Arc<AtomicBool>, released: Arc<AtomicBool>) -> Self {
         RowCtl {
             running: AtomicBool::new(running),
             restart: AtomicBool::new(false),
             pid: AtomicU32::new(0),
             shutdown,
+            released,
         }
+    }
+
+    /// True once this row must be left alone: shutting down, or handed over.
+    fn finished(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst) || self.released.load(Ordering::SeqCst)
     }
 
     fn is_running(&self) -> bool {
@@ -123,18 +130,51 @@ enum Outcome {
     /// Cut short by a stop/restart request, not a failure.
     Interrupted,
     Exited {
-        reached_up: bool,
         status: Option<std::process::ExitStatus>,
         reason: Option<String>,
     },
     SpawnFailed(String),
 }
 
+/// Everything a supervisor needs besides its own row: shared by the dispatcher
+/// and by every row thread it starts.
+#[derive(Clone)]
+struct Engine {
+    cfg: EngineConfig,
+    shutdown: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    evt_tx: Sender<SessionEvent>,
+    ctls: Arc<Mutex<HashMap<ForwardSpec, Arc<RowCtl>>>>,
+}
+
+impl Engine {
+    fn spawn_row(&self, spec: &ForwardSpec, running: bool) {
+        let ctl = Arc::new(RowCtl::new(
+            running,
+            self.shutdown.clone(),
+            self.released.clone(),
+        ));
+        {
+            let mut map = match self.ctls.lock() {
+                Ok(map) => map,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if map.contains_key(spec) {
+                return;
+            }
+            map.insert(spec.clone(), ctl.clone());
+        }
+        let spec = spec.clone();
+        let cfg = self.cfg.clone();
+        let evt_tx = self.evt_tx.clone();
+        thread::spawn(move || supervise(spec, cfg, ctl, evt_tx));
+    }
+}
+
 pub struct Sessions {
     cmd_tx: Sender<Request>,
     evt_rx: Receiver<SessionEvent>,
-    ctls: Arc<Mutex<HashMap<ForwardSpec, Arc<RowCtl>>>>,
-    shutdown: Arc<AtomicBool>,
+    engine: Engine,
 }
 
 impl Sessions {
@@ -143,25 +183,27 @@ impl Sessions {
         let (evt_tx, evt_rx) = mpsc::channel::<SessionEvent>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Request>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
         let ctls: Arc<Mutex<HashMap<ForwardSpec, Arc<RowCtl>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        let engine = Engine {
+            cfg,
+            shutdown: shutdown.clone(),
+            released: released.clone(),
+            evt_tx: evt_tx.clone(),
+            ctls: ctls.clone(),
+        };
         for (spec, running) in rows {
-            spawn_row(&spec, running, &cfg, &shutdown, &evt_tx, &ctls);
+            engine.spawn_row(&spec, running);
         }
-
-        let dispatch_ctls = ctls.clone();
-        let dispatch_shutdown = shutdown.clone();
-        let dispatch_evt = evt_tx.clone();
-        thread::spawn(move || {
-            dispatch(cmd_rx, dispatch_ctls, dispatch_shutdown, cfg, dispatch_evt)
-        });
+        let dispatch_engine = engine.clone();
+        thread::spawn(move || dispatch(cmd_rx, dispatch_engine));
 
         Ok(Sessions {
             cmd_tx,
             evt_rx,
-            ctls,
-            shutdown,
+            engine,
         })
     }
 
@@ -182,7 +224,8 @@ impl Sessions {
     }
 
     pub fn pid_of(&self, spec: &ForwardSpec) -> u32 {
-        self.ctls
+        self.engine
+            .ctls
             .lock()
             .map(|ctls| {
                 ctls.get(spec)
@@ -192,11 +235,17 @@ impl Sessions {
             .unwrap_or(0)
     }
 
+    /// Hands the running forwards over to nobody: the panel calls this on quit
+    /// so the tunnels survive it, and a later panel adopts them.
+    pub fn release(&self) {
+        self.engine.released.store(true, Ordering::SeqCst);
+    }
+
     /// Stops every child and waits (bounded) for them to leave, escalating to
-    /// SIGKILL so no ssh outlives the panel.
+    /// SIGKILL so no ssh outlives the caller.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        let ctls = match self.ctls.lock() {
+        self.engine.shutdown.store(true, Ordering::SeqCst);
+        let ctls = match self.engine.ctls.lock() {
             Ok(ctls) => ctls,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -230,24 +279,20 @@ impl Sessions {
 
 impl Drop for Sessions {
     fn drop(&mut self) {
-        self.shutdown();
+        if !self.engine.released.load(Ordering::SeqCst) {
+            self.shutdown();
+        }
     }
 }
 
-fn dispatch(
-    rx: Receiver<Request>,
-    ctls: Arc<Mutex<HashMap<ForwardSpec, Arc<RowCtl>>>>,
-    shutdown: Arc<AtomicBool>,
-    cfg: EngineConfig,
-    evt_tx: Sender<SessionEvent>,
-) {
+fn dispatch(rx: Receiver<Request>, engine: Engine) {
     while let Ok(request) = rx.recv() {
-        if shutdown.load(Ordering::SeqCst) {
+        if engine.shutdown.load(Ordering::SeqCst) || engine.released.load(Ordering::SeqCst) {
             return;
         }
         let mut missing: Option<ForwardSpec> = None;
         {
-            let map = match ctls.lock() {
+            let map = match engine.ctls.lock() {
                 Ok(map) => map,
                 Err(poisoned) => poisoned.into_inner(),
             };
@@ -276,79 +321,43 @@ fn dispatch(
             }
         }
         if let Some(spec) = missing {
-            spawn_row(&spec, true, &cfg, &shutdown, &evt_tx, &ctls);
+            engine.spawn_row(&spec, true);
         }
     }
-}
-
-/// Adds a row to the running engine; the panel calls this whenever the config
-/// gains a row while the panel is open.
-fn spawn_row(
-    spec: &ForwardSpec,
-    running: bool,
-    cfg: &EngineConfig,
-    shutdown: &Arc<AtomicBool>,
-    evt_tx: &Sender<SessionEvent>,
-    ctls: &Arc<Mutex<HashMap<ForwardSpec, Arc<RowCtl>>>>,
-) {
-    let ctl = Arc::new(RowCtl::new(running, shutdown.clone()));
-    {
-        let mut map = match ctls.lock() {
-            Ok(map) => map,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if map.contains_key(spec) {
-            return;
-        }
-        map.insert(spec.clone(), ctl.clone());
-    }
-    let spec = spec.clone();
-    let cfg = cfg.clone();
-    let evt_tx = evt_tx.clone();
-    thread::spawn(move || supervise(spec, cfg, ctl, evt_tx));
 }
 
 fn supervise(spec: ForwardSpec, cfg: EngineConfig, ctl: Arc<RowCtl>, evt: Sender<SessionEvent>) {
     let mut attempt: u32 = 0;
     let mut stopped_announced = false;
-    let mut was_up = false;
 
     loop {
-        if ctl.shutdown.load(Ordering::SeqCst) {
+        if ctl.finished() {
             return;
         }
         if !ctl.is_running() {
-            if !stopped_announced || was_up {
+            if !stopped_announced {
                 publish(&evt, &spec, Status::Stopped);
                 stopped_announced = true;
             }
-            was_up = false;
             thread::sleep(IDLE_TICK);
             continue;
         }
         stopped_announced = false;
-        publish(&evt, &spec, Status::Starting);
 
-        let outcome = run_child(&spec, &cfg, &ctl, &evt);
+        let outcome = run_session(&spec, &cfg, &ctl, &evt);
         ctl.pid.store(0, Ordering::SeqCst);
         let _ = cfg.runtime.remove_record(&spec);
 
-        if ctl.shutdown.load(Ordering::SeqCst) {
+        if ctl.finished() {
             return;
         }
         let restarted = ctl.restart.swap(false, Ordering::SeqCst);
         match outcome {
             Outcome::Interrupted => continue,
             Outcome::SpawnFailed(reason) => {
-                was_up = false;
                 fail(&evt, &spec, reason, &mut attempt, &cfg, &ctl);
             }
-            Outcome::Exited {
-                reached_up,
-                status,
-                reason,
-            } => {
-                was_up = reached_up;
+            Outcome::Exited { status, reason } => {
                 if restarted {
                     attempt = 0;
                     continue;
@@ -398,12 +407,77 @@ fn sleep_interruptible(total: Duration, ctl: &RowCtl) {
     }
 }
 
+/// Adopts a forward a previous panel left running, otherwise starts a new ssh.
+fn run_session(
+    spec: &ForwardSpec,
+    cfg: &EngineConfig,
+    ctl: &RowCtl,
+    evt: &Sender<SessionEvent>,
+) -> Outcome {
+    match adoptable(spec, cfg) {
+        Some(record) => watch_adopted(spec, cfg, ctl, evt, record),
+        None => run_child(spec, cfg, ctl, evt),
+    }
+}
+
+fn adoptable(spec: &ForwardSpec, cfg: &EngineConfig) -> Option<SessionRecord> {
+    adopted(&cfg.runtime, spec)
+}
+
+/// The record of a forward that is already running and belongs to this row:
+/// written by a previous panel and matched by command line.
+pub fn adopted(runtime: &RuntimeDir, spec: &ForwardSpec) -> Option<SessionRecord> {
+    let record = runtime.record_for(spec)?;
+    if !crate::runtime::process_alive(record.ssh_pid)
+        || !crate::runtime::process_carries(record.ssh_pid, &spec.forward_arg())
+    {
+        return None;
+    }
+    Some(record)
+}
+
+/// Watches an adopted ssh that we did not spawn: there is no `Child` to wait
+/// on, so liveness is polled and killing goes through the recorded pid.
+fn watch_adopted(
+    spec: &ForwardSpec,
+    cfg: &EngineConfig,
+    ctl: &RowCtl,
+    evt: &Sender<SessionEvent>,
+    record: SessionRecord,
+) -> Outcome {
+    let pid = record.ssh_pid;
+    ctl.pid.store(pid, Ordering::SeqCst);
+    publish(
+        evt,
+        spec,
+        Status::Up {
+            since: UNIX_EPOCH + Duration::from_secs(record.started_at),
+        },
+    );
+    loop {
+        if ctl.stopping() || ctl.restart.load(Ordering::SeqCst) {
+            ctl.kill_pid();
+            return Outcome::Interrupted;
+        }
+        if !crate::runtime::process_alive(pid) {
+            return Outcome::Exited {
+                status: None,
+                reason: cfg.runtime.last_log_line(spec),
+            };
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn run_child(
     spec: &ForwardSpec,
     cfg: &EngineConfig,
     ctl: &RowCtl,
     evt: &Sender<SessionEvent>,
 ) -> Outcome {
+    // Only a real spawn is "starting"; an adopted forward is already up, and
+    // announcing Starting for it would flash a placeholder on the first frame.
+    publish(evt, spec, Status::Starting);
     let log = match cfg.runtime.open_log(spec) {
         Ok(log) => log,
         Err(e) => return Outcome::SpawnFailed(format!("cannot open log: {e}")),
@@ -414,6 +488,14 @@ fn run_child(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
+    // SAFETY: setsid(2) only puts the child in its own session, so closing the
+    // terminal the panel ran in cannot hang the tunnel up.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -423,9 +505,7 @@ fn run_child(
     ctl.pid.store(pid, Ordering::SeqCst);
     let _ = cfg.runtime.write_record(&SessionRecord {
         spec: spec.clone(),
-        owner: cfg.owner,
         ssh_pid: pid,
-        supervisor_pid: (cfg.owner == Owner::Daemon).then(std::process::id),
         started_at: now_secs(),
     });
 
@@ -439,7 +519,6 @@ fn run_child(
         match child.try_wait() {
             Ok(Some(status)) => {
                 return Outcome::Exited {
-                    reached_up: false,
                     status: Some(status),
                     reason: cfg.runtime.last_log_line(spec),
                 };
@@ -448,7 +527,6 @@ fn run_child(
             Err(e) => {
                 terminate(&mut child);
                 return Outcome::Exited {
-                    reached_up: false,
                     status: None,
                     reason: Some(format!("cannot watch ssh: {e}")),
                 };
@@ -469,11 +547,7 @@ fn run_child(
     );
     let status = child.wait().ok();
     let reason = cfg.runtime.last_log_line(spec);
-    Outcome::Exited {
-        reached_up: true,
-        status,
-        reason,
-    }
+    Outcome::Exited { status, reason }
 }
 
 fn terminate(child: &mut Child) {
@@ -562,7 +636,7 @@ mod tests {
             up_grace_ms: 50,
             ..Options::default()
         };
-        let mut cfg = EngineConfig::new(options, runtime, Owner::Panel);
+        let mut cfg = EngineConfig::new(options, runtime);
         cfg.ssh_program = program;
         cfg
     }
@@ -689,13 +763,104 @@ mod tests {
     }
 
     #[test]
+    fn adopts_a_running_forward_instead_of_spawning_a_second_ssh() {
+        let dir = std::env::temp_dir().join(format!("sl-sess-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let spec = spec("8002:wk:8000");
+        let started_at = 1_700_000_000;
+
+        // A stand-in for the ssh a previous panel left running.
+        let mut stand_in = std::process::Command::new("yes")
+            .arg("--")
+            .arg(spec.forward_arg())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawns yes");
+        let runtime = RuntimeDir::at(dir.join("rt-adopt"));
+        runtime
+            .write_record(&SessionRecord {
+                spec: spec.clone(),
+                ssh_pid: stand_in.id(),
+                started_at,
+            })
+            .unwrap();
+
+        let options = Options {
+            retry_secs: 1,
+            up_grace_ms: 50,
+            ..Options::default()
+        };
+        let mut cfg = EngineConfig::new(options, runtime).batch_mode(true);
+        cfg.ssh_program = fake_ssh(&dir, "exit 99");
+        let sessions = Sessions::start(vec![(spec.clone(), true)], cfg).unwrap();
+        let rx = sessions.events();
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("engine event");
+        match first.status {
+            Status::Up { since } => {
+                let seconds = since
+                    .duration_since(UNIX_EPOCH)
+                    .expect("start time")
+                    .as_secs();
+                assert_eq!(seconds, started_at);
+            }
+            other => panic!("an adopted row must not announce {other:?}"),
+        }
+        assert_eq!(
+            sessions.pid_of(&spec),
+            stand_in.id(),
+            "must adopt, not respawn"
+        );
+
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
+        next_status(
+            rx,
+            |s| matches!(s, Status::Waiting { .. }),
+            Duration::from_secs(5),
+        );
+        sessions.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_released_forward_outlives_its_handle() {
+        let dir = std::env::temp_dir().join(format!("sl-sess-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let program = fake_ssh(&dir, "exec sleep 30");
+        let cfg = engine("release", &dir, program, 1);
+        let spec = spec("8003:wk:8000");
+        let sessions = Sessions::start(vec![(spec.clone(), true)], cfg).unwrap();
+        let rx = sessions.events();
+
+        next_status(rx, |s| s.is_up(), Duration::from_secs(5));
+        let pid = sessions.pid_of(&spec);
+        sessions.release();
+        drop(sessions);
+        assert!(
+            crate::runtime::process_alive(pid),
+            "a released forward must survive the handle"
+        );
+
+        signal(pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::runtime::process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(TICK);
+        }
+        assert!(
+            !crate::runtime::process_alive(pid),
+            "no respawn after release"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ssh_args_carry_the_forward_and_batch_mode() {
-        let cfg = EngineConfig::new(
-            Options::default(),
-            RuntimeDir::at("/tmp/unused"),
-            Owner::Panel,
-        )
-        .batch_mode(true);
+        let cfg =
+            EngineConfig::new(Options::default(), RuntimeDir::at("/tmp/unused")).batch_mode(true);
         let args = ssh_args(&spec("8001:wk:8000"), &cfg);
         assert!(args.contains(&"-L".to_string()));
         assert!(args.contains(&"127.0.0.1:8001:localhost:8000".to_string()));

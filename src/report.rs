@@ -2,13 +2,16 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::forward::ForwardSpec;
 use crate::sessions::{SessionEvent, Sessions, Status};
 
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+/// How long to wait for the next engine event before re-checking the signal.
+const IDLE_POLL: Duration = Duration::from_millis(200);
 
 extern "C" fn on_signal(_: libc::c_int) {
     SIGNALLED.store(true, Ordering::SeqCst);
@@ -24,36 +27,41 @@ pub fn install_signal_handlers() {
 
 /// Prints status changes until Ctrl-C, or until every row has failed at least
 /// once — the same promise the old script made when it exited non-zero.
-pub fn run(sessions: &Sessions, specs: &[ForwardSpec], quiet: bool) -> i32 {
+pub fn run(sessions: &Sessions, specs: &[ForwardSpec]) -> i32 {
     let mut statuses: HashMap<ForwardSpec, Status> = specs
         .iter()
         .map(|spec| (spec.clone(), Status::Starting))
         .collect();
+    let events = sessions.events();
 
     loop {
         if SIGNALLED.swap(false, Ordering::SeqCst) {
             sessions.shutdown();
             return 0;
         }
-        while let Ok(event) = sessions.events().try_recv() {
-            if !quiet {
-                print_event(&event);
-            }
-            statuses.insert(event.spec, event.status);
+        match events.recv_timeout(IDLE_POLL) {
+            Ok(event) => absorb(&mut statuses, event),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
         }
-        let settled: Vec<&Status> = statuses
+        while let Ok(event) = events.try_recv() {
+            absorb(&mut statuses, event);
+        }
+        let settled = statuses
             .values()
-            .filter(|s| !matches!(s, Status::Starting))
-            .collect();
-        if settled.len() == statuses.len() && !statuses.values().any(Status::is_up) {
-            if !quiet {
-                eprintln!("sl: no forward is up, giving up");
-            }
+            .filter(|status| !matches!(status, Status::Starting))
+            .count();
+        if settled == statuses.len() && !statuses.values().any(Status::is_up) {
+            eprintln!("sl: no forward is up, giving up");
             sessions.shutdown();
             return 1;
         }
-        thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn absorb(statuses: &mut HashMap<ForwardSpec, Status>, event: SessionEvent) {
+    print_event(&event);
+    statuses.insert(event.spec, event.status);
 }
 
 fn print_event(event: &SessionEvent) {

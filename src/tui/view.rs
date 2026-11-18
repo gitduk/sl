@@ -43,28 +43,21 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("  enter: keep  esc: clear", Style::default().fg(t::MUTED)),
         ])
     } else {
-        Line::from(vec![
-            key("j/k"),
-            Span::styled(" select  ", Style::default().fg(t::MUTED)),
-            key("n"),
-            Span::styled(" new  ", Style::default().fg(t::MUTED)),
-            key("e"),
-            Span::styled(" edit  ", Style::default().fg(t::MUTED)),
-            key("d"),
-            Span::styled(" delete  ", Style::default().fg(t::MUTED)),
-            key("enter"),
-            Span::styled(" restart  ", Style::default().fg(t::MUTED)),
-            key("space"),
-            Span::styled(" run/stop  ", Style::default().fg(t::MUTED)),
-            key("t"),
-            Span::styled(" test  ", Style::default().fg(t::MUTED)),
-            key("/"),
-            Span::styled(" filter  ", Style::default().fg(t::MUTED)),
-            key("?"),
-            Span::styled(" help  ", Style::default().fg(t::MUTED)),
-            key("q"),
-            Span::styled(" quit", Style::default().fg(t::MUTED)),
-        ])
+        let mut spans = Vec::new();
+        for binding in super::keys::BINDINGS {
+            let Some(label) = binding.bar else {
+                continue;
+            };
+            spans.push(Span::styled(
+                binding.keys,
+                Style::default().fg(t::WARNING).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {label}  "),
+                Style::default().fg(t::MUTED),
+            ));
+        }
+        Line::from(spans)
     };
 
     let detail = match &app.message {
@@ -88,13 +81,6 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ),
         area,
     );
-}
-
-fn key(text: &'static str) -> Span<'static> {
-    Span::styled(
-        text,
-        Style::default().fg(t::WARNING).add_modifier(Modifier::BOLD),
-    )
 }
 
 /// A fixed-size box in the middle, clamped so a small terminal still shows it.
