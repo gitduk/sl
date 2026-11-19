@@ -23,7 +23,8 @@ pub const BINDINGS: &[Binding] = &[
     binding("a", "add a forward", Some("add")),
     binding("e", "edit the selected forward", Some("edit")),
     binding("d", "delete the selected forward", Some("del")),
-    binding("enter", "restart the selected forward", Some("restart")),
+    binding("r", "restart the selected forward", Some("restart")),
+    binding("R", "restart every row", None),
     binding("space", "start or stop the selected row", Some("run")),
     binding("s/S", "start / stop every row", None),
     binding("t", "probe the local listen port", Some("test")),
@@ -62,6 +63,10 @@ pub fn handle_paste(app: &mut App, text: &str) {
 }
 
 fn normal(app: &mut App, key: KeyEvent) {
+    // ctrl+letter arrives as Char + CONTROL; no single-letter action wants it.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return;
+    }
     if app.filtering {
         match key.code {
             KeyCode::Esc => {
@@ -97,7 +102,8 @@ fn normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('G') => app.select(usize::MAX),
         KeyCode::Char('e') => app.open_editor(),
         KeyCode::Char('d') => app.request_delete(),
-        KeyCode::Enter => app.restart_selected(),
+        KeyCode::Char('r') => app.restart_selected(),
+        KeyCode::Char('R') => app.restart_all(),
         KeyCode::Char(' ') => app.toggle_selected(),
         KeyCode::Char('a') => app.new_editor(),
         KeyCode::Char('s') => app.set_all(true),

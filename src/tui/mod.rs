@@ -289,6 +289,24 @@ mod tests {
     }
 
     #[test]
+    fn capital_r_restarts_every_row() {
+        let mut app = panel(&["wk:8000", "ds:9000"]);
+        app.config.forward[1].enabled = false;
+        keys::handle(&mut app, key(KeyCode::Char('R')));
+        assert!(app.config.forward.iter().all(|entry| entry.enabled));
+    }
+
+    #[test]
+    fn ctrl_letter_does_not_reach_a_single_letter_action() {
+        let mut app = panel(&["wk:8000"]);
+        keys::handle(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert!(app.message.is_none(), "ctrl+r must not restart the row");
+    }
+
+    #[test]
     fn help_overlay_lists_the_keys() {
         let mut app = panel(&["wk:8000"]);
         app.mode = Mode::Help;

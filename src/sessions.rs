@@ -44,8 +44,6 @@ pub struct SessionEvent {
 pub enum Request {
     SetRunning(ForwardSpec, bool),
     Restart(ForwardSpec),
-    SetRunningAll(bool),
-    RestartAll,
 }
 
 #[derive(Debug, Clone)]
@@ -307,17 +305,6 @@ fn dispatch(rx: Receiver<Request>, engine: Engine) {
                     Some(ctl) => ctl.set_running(true),
                     None => missing = Some(spec),
                 },
-                Request::SetRunningAll(on) => {
-                    for ctl in map.values() {
-                        ctl.set_running(on);
-                    }
-                }
-                Request::RestartAll => {
-                    for ctl in map.values() {
-                        ctl.set_running(true);
-                        ctl.restart();
-                    }
-                }
             }
         }
         if let Some(spec) = missing {

@@ -258,14 +258,19 @@ impl App {
         }
     }
 
-    /// Writes `enabled` for these rows, saves the config, and tells the engine.
-    fn apply_enabled(&mut self, specs: &[ForwardSpec], run: bool) {
+    /// Writes `enabled` for these rows and saves the config.
+    fn persist_enabled(&mut self, specs: &[ForwardSpec], run: bool) -> bool {
         for spec in specs {
             if let Some(entry) = self.config.forward.iter_mut().find(|e| &e.spec == spec) {
                 entry.enabled = run;
             }
         }
-        if !self.commit() {
+        self.commit()
+    }
+
+    /// Writes `enabled` for these rows, saves the config, and tells the engine.
+    fn apply_enabled(&mut self, specs: &[ForwardSpec], run: bool) {
+        if !self.persist_enabled(specs, run) {
             return;
         }
         if let Some(sessions) = &self.sessions {
@@ -293,20 +298,47 @@ impl App {
         let Some(entry) = self.selected_row().cloned() else {
             return;
         };
-        self.apply_enabled(std::slice::from_ref(&entry.spec), true);
-        if let Some(sessions) = &self.sessions {
-            sessions.restart(&entry.spec);
+        if self.restart(std::slice::from_ref(&entry.spec)) {
+            self.success(format!("restarting {}", entry.spec));
         }
-        self.success(format!("restarting {}", entry.spec));
     }
 
-    pub fn set_all(&mut self, run: bool) {
-        let specs: Vec<ForwardSpec> = self
-            .config
+    pub fn restart_all(&mut self) {
+        let specs = self.all_specs();
+        if specs.is_empty() {
+            return;
+        }
+        if self.restart(&specs) {
+            self.success(format!("restarting {} rows", specs.len()));
+        }
+    }
+
+    /// Enables these rows and asks the engine for a fresh child each; `Restart`
+    /// alone starts a stopped row. False when the save fails, error kept.
+    fn restart(&mut self, specs: &[ForwardSpec]) -> bool {
+        if !self.persist_enabled(specs, true) {
+            return false;
+        }
+        if let Some(sessions) = &self.sessions {
+            for spec in specs {
+                sessions.restart(spec);
+            }
+        }
+        self.clamp_selection();
+        true
+    }
+
+    /// Every configured row's spec, in display order.
+    fn all_specs(&self) -> Vec<ForwardSpec> {
+        self.config
             .forward
             .iter()
             .map(|entry| entry.spec.clone())
-            .collect();
+            .collect()
+    }
+
+    pub fn set_all(&mut self, run: bool) {
+        let specs = self.all_specs();
         self.apply_enabled(&specs, run);
         self.info(if run {
             "started all rows"
@@ -565,6 +597,21 @@ mod tests {
     fn status_falls_back_to_stopped() {
         let app = app_with(&[("wk:8000", true)]);
         assert!(matches!(app.status_of(&spec("wk:8000")), Status::Stopped));
+    }
+
+    #[test]
+    fn restart_all_enables_every_row() {
+        let mut app = app_with(&[("wk:8000", false), ("ds:9000", false)]);
+        app.restart_all();
+        assert!(app.config.forward.iter().all(|entry| entry.enabled));
+        assert!(app.message.is_some(), "the restart is reported");
+    }
+
+    #[test]
+    fn restart_all_with_no_rows_reports_nothing() {
+        let mut app = app_with(&[]);
+        app.restart_all();
+        assert!(app.message.is_none());
     }
 
     #[test]

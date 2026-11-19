@@ -43,7 +43,7 @@ forward listens wherever the far end's `sshd` allows — with `GatewayPorts no`
 ├ log · :8008 ⇒ ds:8000 ───────────────────────────────────────────────────┤
 │bind [127.0.0.1]:8008: Address already in use                            │
 └──────────────────────────────────────────────────────────────────────────┘
- j/k select  a add  e edit  d delete  enter restart  space run/stop  t test
+ j/k select  a add  e edit  d delete  r restart  space run/stop  t test
 ```
 
 | key | action |
@@ -53,7 +53,8 @@ forward listens wherever the far end's `sshd` allows — with `GatewayPorts no`
 | `a` | add a forward |
 | `e` | edit the selected forward |
 | `d` | delete (asks first) |
-| `enter` | restart the selected forward |
+| `r` | restart the selected forward |
+| `R` | restart every row |
 | `space` | start or stop the selected row |
 | `s` `S` | start / stop every row |
 | `t` | probe the local listen port |
