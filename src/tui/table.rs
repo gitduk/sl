@@ -1,6 +1,6 @@
 //! The forwarding table and the summary in its title.
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
@@ -14,7 +14,8 @@ use crate::config::Entry;
 use crate::forward::Direction;
 use crate::sessions::Status;
 
-const STATE_WIDTH: u16 = 24;
+/// Every word the State cell can show; the column is as wide as the longest.
+const STATES: [&str; 6] = ["disabled", "starting", "waiting", "stopped", "failed", "up"];
 
 /// What a row reads as before the engine has said anything about it.
 const UNKNOWN: Status = Status::Stopped;
@@ -51,14 +52,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     ])
     .style(Style::default().fg(t::MUTED).add_modifier(Modifier::BOLD));
 
-    let host_width = app
-        .config
-        .forward
-        .iter()
-        .map(|entry| entry.spec.host.as_str().len())
-        .max()
-        .unwrap_or(4)
-        .max(4) as u16;
+    let widths = widths(app);
 
     let visible = app.visible();
     let mut rows = Vec::with_capacity(visible.len());
@@ -69,26 +63,36 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         rows.push(Row::new(cells(app, entry)));
     }
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Length(host_width),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(STATE_WIDTH),
-            Constraint::Length(6),
-            Constraint::Length(6),
-        ],
-    )
-    .header(header)
-    .column_spacing(2)
-    .block(Block::bordered().title(title(app)))
-    .row_highlight_style(Style::default().bg(t::HIGHLIGHT_BG));
+    let table = Table::new(rows, widths.map(Constraint::Length))
+        .header(header)
+        .column_spacing(2)
+        .block(Block::bordered().title(title(app)))
+        .row_highlight_style(Style::default().bg(t::HIGHLIGHT_BG));
 
     let mut state = TableState::default();
     state.select(Some(app.selected));
     f.render_stateful_widget(table, area, &mut state);
+}
+
+/// Column widths: the longest value each column can show, its header included.
+/// Free-form columns follow the whole config, so filtering never moves them.
+fn widths(app: &App) -> [u16; 7] {
+    let mut host = "Host".len() as u16;
+    let mut listen = "Listen".len() as u16;
+    let mut target = "Target".len() as u16;
+    for entry in &app.config.forward {
+        host = host.max(entry.spec.host.as_str().chars().count() as u16);
+        listen = listen.max(entry.spec.listen_display().chars().count() as u16);
+        target = target.max(entry.spec.target_display().chars().count() as u16);
+    }
+    let state = STATES
+        .iter()
+        .map(|word| word.len() as u16)
+        .max()
+        .unwrap_or(0)
+        .max("State".len() as u16);
+    // Up fits `17h47`; Retry fits `#17280 17h47`, a day of 5s retries.
+    [3, host, listen, target, state, 5, 12]
 }
 
 fn cells(app: &App, entry: &Entry) -> Vec<Cell<'static>> {
@@ -102,7 +106,10 @@ fn cells(app: &App, entry: &Entry) -> Vec<Cell<'static>> {
         _ => "-".to_string(),
     };
     let retry = match status {
-        Status::Waiting { attempt, .. } => attempt.to_string(),
+        Status::Waiting { attempt, retry_at } => {
+            let left = retry_at.saturating_duration_since(Instant::now()).as_secs();
+            format!("#{attempt} {}", compact(left))
+        }
         _ => "-".to_string(),
     };
     vec![
@@ -129,19 +136,8 @@ fn state_cell(entry: &Entry, status: &Status) -> Span<'static> {
     match status {
         Status::Starting => Span::styled("starting", Style::default().fg(t::WARNING)),
         Status::Up { .. } => Span::styled("up", Style::default().fg(t::SUCCESS)),
-        Status::Failed { reason } => Span::styled(
-            shorten(reason, STATE_WIDTH as usize - 1),
-            Style::default().fg(t::ERROR),
-        ),
-        Status::Waiting { attempt, retry_at } => {
-            let left = retry_at
-                .saturating_duration_since(std::time::Instant::now())
-                .as_secs();
-            Span::styled(
-                format!("retry #{attempt} in {left}s"),
-                Style::default().fg(t::WARNING),
-            )
-        }
+        Status::Failed { .. } => Span::styled("failed", Style::default().fg(t::ERROR)),
+        Status::Waiting { .. } => Span::styled("waiting", Style::default().fg(t::WARNING)),
         Status::Stopped => Span::styled("stopped", Style::default().fg(t::MUTED)),
     }
 }
@@ -189,6 +185,11 @@ fn elapsed(since: SystemTime) -> String {
         .duration_since(since)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    compact(secs)
+}
+
+/// One unit, so a duration fits a cell: `45s`, `3m`, `2h05`, `7d`.
+fn compact(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
         60..=3599 => format!("{}m", secs / 60),
@@ -197,30 +198,9 @@ fn elapsed(since: SystemTime) -> String {
     }
 }
 
-/// Keeps the ssh message readable in one cell: the tail is what names the port.
-fn shorten(text: &str, width: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let tail: String = text
-        .chars()
-        .skip(text.chars().count().saturating_sub(width - 1))
-        .collect();
-    format!("…{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shorten_keeps_the_tail() {
-        let text = "bind [127.0.0.1]:8000: Address already in use";
-        let short = shorten(text, 12);
-        assert_eq!(short.chars().count(), 12);
-        assert!(short.ends_with("in use"), "{short}");
-    }
 
     #[test]
     fn elapsed_is_compact() {

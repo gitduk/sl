@@ -35,15 +35,16 @@ forward listens wherever the far end's `sshd` allows — with `GatewayPorts no`
 ## Panel
 
 ```
-┌ sl — 3 rows, 2 up ───────────────────────────────────────────────────────┐
-│      Host  Listen   Target     State      Up     Retry                   │
-│[L]   wk    :8000    wk:8000    up         12m    -                       │
-│[x]   ds    :8008    ds:8000    port in use -      3                      │
-│[R]   wk    wk:5056  :8080     up         2m     -                       │
-├ log · :8008 ⇒ ds:8000 ───────────────────────────────────────────────────┤
-│bind [127.0.0.1]:8008: Address already in use                            │
+┌ sl 3 rows  2 up  1 failed────────────────────────────────────────────────┐
+│     Host  Listen   Target   State     Up     Retry                       │
+│[L]  wk    :8000    wk:8000  up        12m    -                           │
+│[L]  ds    :8008    ds:8008  failed    -      -                           │
+│[R]  wk    wk:5056  :8080    up        2m     -                           │
 └──────────────────────────────────────────────────────────────────────────┘
- j/k select  a add  e edit  d delete  r restart  space run/stop  t test
+┌ log · :8008 ⇒ ds:8008 ───────────────────────────────────────────────────┐
+│bind [127.0.0.1]:8008: Address already in use                             │
+└──────────────────────────────────────────────────────────────────────────┘
+ j/k select  a add  e edit  d del  r restart  space run  t test  / filter
 ```
 
 | key | action |

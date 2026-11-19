@@ -189,23 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn long_ssh_reason_stays_in_its_cell() {
-        let mut app = panel(&["wk:8000"]);
-        app.statuses.insert(
-            spec("wk:8000"),
-            Status::Failed {
-                reason: "bind [127.0.0.1]:8000: Address already in use".into(),
-            },
-        );
-        let text = screen(&mut app, 100, 30);
-        assert!(text.contains("already in use"), "{text}");
-        assert!(
-            !text.contains("bind [127.0.0.1]"),
-            "reason must be shortened:\n{text}"
-        );
-    }
-
-    #[test]
     fn editor_overlay_shows_the_pattern_and_errors() {
         let mut app = panel(&[]);
         app.mode = Mode::Editor(Editor {
